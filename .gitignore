@@ -1,7 +1,4 @@
-X_train.csv
-X_test.csv
-y_train.csv
-sample.csv
+data/
 .claude/
 __pycache__/
 *.pyc

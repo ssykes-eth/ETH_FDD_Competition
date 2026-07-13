@@ -36,9 +36,9 @@ XGB_PARAMS = dict(
 
 
 def load_data():
-    X_train = pd.read_csv("X_train.csv").set_index("id")
-    y_train = pd.read_csv("y_train.csv").set_index("id")["y"]
-    X_test = pd.read_csv("X_test.csv").set_index("id")
+    X_train = pd.read_csv("data/X_train.csv").set_index("id")
+    y_train = pd.read_csv("data/y_train.csv").set_index("id")["y"]
+    X_test = pd.read_csv("data/X_test.csv").set_index("id")
     return X_train, y_train, X_test
 
 
