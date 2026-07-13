@@ -1,0 +1,14 @@
+Summary from Claude
+
+Data: 1212 training / 776 test subjects, 832 anonymized features (x0-x831), target is age (42-97). Every column has some missingness (up to 10%), a few columns contain single-cell corrupted values (up to ~1e23), and 4 columns are constant.
+
+Pipeline built in brain_age.py:
+1. Cell-outlier neutralization — MAD-based robust z-score (fit on train) flags absurd single-cell values and treats them as missing.
+2. Imputation (Subtask 0) — median imputation fit on train, applied to both sets; drops 4 constant columns.
+3. Outlier row detection (Subtask 1) — IsolationForest (5% contamination) flags/removes 61 anomalous training samples before fitting the final model.
+4. Feature selection (Subtask 2) — mutual information ranking keeps the top 250 of 828 features, discarding irrelevant/redundant ones.
+5. Regression (Main task) — tuned XGBRegressor, evaluated with proper nested 5-fold CV (feature selection refit inside each fold to avoid leakage).
+
+Result: CV R² = 0.502 ± 0.045, clearing the 0.5 baseline. submission.csv is written in the exact sample.csv format, ready for Kaggle upload.
+
+Next step if you want to push the score higher: try stacking multiple model types, tune the outlier contamination rate, or experiment with feature counts beyond 250 — happy to iterate.
