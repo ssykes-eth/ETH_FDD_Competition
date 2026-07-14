@@ -1,149 +1,96 @@
 """
 Brain Age Prediction pipeline.
 
-Steps (matching the project's subtasks):
-  0. Impute missing values
-  1. Detect & remove outlier samples (rows)
-  2. Select relevant features, drop irrelevant/redundant ones
-  3. Fit a regression model to predict age and produce submission.csv
+Cross-validates the pipeline defined in pipeline.py (leak-free: every fitted
+step — cell-outlier bounds, imputer, IsolationForest, feature ranking, and
+the model(s) themselves — is refit inside each training fold and only ever
+applied to, never fit on, the held-out fold), then fits the same pipeline
+once on the full training set and writes submission.csv.
 
-Run: python brain_age.py
+The model is a 5-way stacking ensemble (see pipeline.build_base_models):
+two XGBoost configs, ElasticNet, ExtraTrees, and HistGradientBoosting,
+blended by a non-negative-least-squares meta-model trained on out-of-fold
+predictions. This beat a single tuned XGBoost on every CV fold (see
+eval_ensemble.py): R^2 0.5168 vs. 0.5015, MAE 4.99 vs. 5.12, RMSE 6.72 vs.
+6.83. Set MODEL_TYPE="xgb" to fall back to the single-model pipeline (~15x
+cheaper to fit, since the ensemble's inner CV refits 5 models per fold).
+
+Run: python main.py
 """
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.feature_selection import mutual_info_regression
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.preprocessing import RobustScaler
-import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
 
-RANDOM_STATE = 0
-N_SELECTED_FEATURES = 250
-OUTLIER_CONTAMINATION = 0.05
-CELL_OUTLIER_Z_THRESH = 15  # robust (MAD-based) z-score threshold for single-cell corruption
+from pipeline import RANDOM_STATE, load_data, run_pipeline
 
+N_SELECTED_FEATURES = 300
+FEATURE_SELECTION_METHOD = "xgb_importance"
+OUTLIER_CONTAMINATION = 0.0
+NEAR_CONSTANT_STD = None  # e.g. 1e-8 to also drop near-zero-variance columns; see tune.py
+MODEL_TYPE = "stack"  # "stack" (5-model ensemble, best CV score) or "xgb" (single model, much faster)
+
+# Only used when MODEL_TYPE="xgb"; the "stack" ensemble's own XGBoost members
+# are configured in pipeline.build_base_models (its "xgb_main" matches this).
 XGB_PARAMS = dict(
     n_estimators=500,
     max_depth=4,
-    learning_rate=0.02,
-    subsample=0.7,
+    learning_rate=0.03,
+    subsample=0.8,
     colsample_bytree=0.4,
-    reg_lambda=2.0,
+    reg_lambda=5.0,
+    min_child_weight=1,
     random_state=RANDOM_STATE,
     n_jobs=-1,
 )
 
-
-def load_data():
-    X_train = pd.read_csv("data/X_train.csv").set_index("id")
-    y_train = pd.read_csv("data/y_train.csv").set_index("id")["y"]
-    X_test = pd.read_csv("data/X_test.csv").set_index("id")
-    return X_train, y_train, X_test
-
-
-def neutralize_cell_outliers(X_train, X_test, z_thresh=CELL_OUTLIER_Z_THRESH):
-    """A handful of cells hold absurd corrupted values (e.g. 1e22) far outside
-    their column's own distribution. Flag them via a robust MAD z-score
-    (computed on train only) and treat them as missing so imputation fills
-    them in instead."""
-    med = X_train.median()
-    mad = (X_train - med).abs().median().replace(0, np.nan)
-
-    def flag(df):
-        modz = 0.6745 * (df - med) / mad
-        return modz.abs() > z_thresh
-
-    X_train = X_train.copy()
-    X_test = X_test.copy()
-    X_train[flag(X_train)] = np.nan
-    X_test[flag(X_test)] = np.nan
-    return X_train, X_test
+CONFIG = dict(
+    fs_method=FEATURE_SELECTION_METHOD,
+    n_features=N_SELECTED_FEATURES,
+    contamination=OUTLIER_CONTAMINATION,
+    xgb_params=XGB_PARAMS,
+    near_constant_std=NEAR_CONSTANT_STD,
+    model_type=MODEL_TYPE,
+)
 
 
-def impute_and_clean(X_train, X_test):
-    """Subtask 0: fill missing values (median, fit on train only).
-    Also drops constant columns, which carry no signal."""
-    imputer = SimpleImputer(strategy="median")
-    X_train_imp = pd.DataFrame(
-        imputer.fit_transform(X_train), index=X_train.index, columns=X_train.columns
-    )
-    X_test_imp = pd.DataFrame(
-        imputer.transform(X_test), index=X_test.index, columns=X_test.columns
-    )
-
-    non_constant = X_train_imp.nunique() > 1
-    keep_cols = non_constant[non_constant].index
-    print(f"Dropped {(~non_constant).sum()} constant column(s)")
-
-    return X_train_imp[keep_cols], X_test_imp[keep_cols]
-
-
-def detect_outlier_rows(X_train_scaled, contamination=OUTLIER_CONTAMINATION):
-    """Subtask 1: classify each training sample as outlier / inlier."""
-    detector = IsolationForest(
-        n_estimators=300, contamination=contamination, random_state=RANDOM_STATE
-    )
-    labels = detector.fit_predict(X_train_scaled)  # 1 = inlier, -1 = outlier
-    is_outlier = labels == -1
-    print(f"Flagged {is_outlier.sum()} / {len(labels)} training samples as outliers")
-    return is_outlier
-
-
-def select_features(X_train, y_train, n_features=N_SELECTED_FEATURES):
-    """Subtask 2: rank features by mutual information with age and keep the
-    top N, discarding irrelevant/redundant ones."""
-    mi = mutual_info_regression(X_train, y_train, random_state=RANDOM_STATE)
-    ranking = pd.Series(mi, index=X_train.columns).sort_values(ascending=False)
-    selected = ranking.head(n_features).index
-    print(f"Selected {len(selected)} / {X_train.shape[1]} features")
-    return selected
-
-
-def evaluate_pipeline(X, y, n_splits=5):
-    """Nested cross-validation: feature selection is refit inside each fold
-    so the reported score isn't inflated by leakage."""
+def cross_validate(X, y, config, n_splits=5):
+    """Run the exact same pipeline used for the final fit inside each CV
+    fold, reporting R^2, MAE and RMSE on the untouched validation fold."""
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-    scores = []
-    for train_idx, val_idx in kf.split(X):
+    r2s, maes, rmses = [], [], []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X), start=1):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-        cols = select_features(X_tr, y_tr)
-        model = xgb.XGBRegressor(**XGB_PARAMS)
-        model.fit(X_tr[cols], y_tr)
-        scores.append(model.score(X_val[cols], y_val))
-    scores = np.array(scores)
-    print(f"Cross-validated R^2: {scores.mean():.4f} +/- {scores.std():.4f} {scores}")
-    return scores
+        model, X_val_sel, _ = run_pipeline(X_tr, y_tr, X_val, config)
+        preds = model.predict(X_val_sel)
+
+        r2s.append(r2_score(y_val, preds))
+        maes.append(mean_absolute_error(y_val, preds))
+        rmses.append(np.sqrt(mean_squared_error(y_val, preds)))
+        print(f"  fold {fold}: R^2={r2s[-1]:.4f}  MAE={maes[-1]:.4f}  RMSE={rmses[-1]:.4f}")
+
+    r2s, maes, rmses = np.array(r2s), np.array(maes), np.array(rmses)
+    print(f"CV R^2:  {r2s.mean():.4f} +/- {r2s.std():.4f}")
+    print(f"CV MAE:  {maes.mean():.4f} +/- {maes.std():.4f}")
+    print(f"CV RMSE: {rmses.mean():.4f} +/- {rmses.std():.4f}")
+    return {"r2": r2s, "mae": maes, "rmse": rmses}
 
 
 def main():
     X_train, y_train, X_test = load_data()
     print(f"X_train {X_train.shape}, X_test {X_test.shape}")
 
-    X_train, X_test = neutralize_cell_outliers(X_train, X_test)
-    X_train, X_test = impute_and_clean(X_train, X_test)
+    print("Cross-validating (leak-free: preprocessing/outliers/features refit per fold)...")
+    cross_validate(X_train, y_train, CONFIG)
 
-    scaler = RobustScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train), index=X_train.index, columns=X_train.columns
-    )
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test), index=X_test.index, columns=X_test.columns
-    )
+    print("Fitting final model on the full training set...")
+    model, X_test_sel, selected = run_pipeline(X_train, y_train, X_test, CONFIG)
+    print(f"Selected {len(selected)} / {X_train.shape[1]} features for the final model")
 
-    is_outlier = detect_outlier_rows(X_train_scaled)
-    X_clean = X_train_scaled[~is_outlier]
-    y_clean = y_train[~is_outlier]
-
-    evaluate_pipeline(X_clean, y_clean)
-
-    selected_features = select_features(X_clean, y_clean)
-    model = xgb.XGBRegressor(**XGB_PARAMS)
-    model.fit(X_clean[selected_features], y_clean)
-
-    predictions = model.predict(X_test_scaled[selected_features])
+    predictions = model.predict(X_test_sel)
     submission = pd.DataFrame({"id": X_test.index, "y": predictions})
     submission.to_csv("submission.csv", index=False)
     print("Wrote submission.csv")

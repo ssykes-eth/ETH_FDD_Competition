@@ -2,13 +2,25 @@ Summary from Claude
 
 Data: 1212 training / 776 test subjects, 832 anonymized features (x0-x831), target is age (42-97). Every column has some missingness (up to 10%), a few columns contain single-cell corrupted values (up to ~1e23), and 4 columns are constant.
 
-Pipeline built in brain_age.py:
-1. Cell-outlier neutralization — MAD-based robust z-score (fit on train) flags absurd single-cell values and treats them as missing.
-2. Imputation (Subtask 0) — median imputation fit on train, applied to both sets; drops 4 constant columns.
-3. Outlier row detection (Subtask 1) — IsolationForest (5% contamination) flags/removes 61 anomalous training samples before fitting the final model.
-4. Feature selection (Subtask 2) — mutual information ranking keeps the top 250 of 828 features, discarding irrelevant/redundant ones.
-5. Regression (Main task) — tuned XGBRegressor, evaluated with proper nested 5-fold CV (feature selection refit inside each fold to avoid leakage).
+Code is split across:
+- pipeline.py — leak-free building blocks (preprocessing, outlier removal, feature selection, model fitting) plus run_pipeline(), the single function both CV and the final fit call.
+- main.py — cross-validates run_pipeline(), then fits it once on the full training set and writes submission.csv.
+- tune.py — offline staged search (n_features x contamination -> feature-selection method -> XGB hyperparameters -> reg_lambda refinement) used to pick the single-model config.
+- eval_ensemble.py — one-off comparison of the single tuned XGB against the stacking ensemble under the same leak-free 5-fold CV harness.
 
-Result: CV R² = 0.502 ± 0.045, clearing the 0.5 baseline. submission.csv is written in the exact sample.csv format, ready for Kaggle upload.
+Pipeline (fit strictly inside each CV fold — no leakage from the validation fold into any fitted statistic, including the model(s) themselves):
+1. Cell-outlier neutralization — MAD-based robust z-score (fit on train fold only) flags absurd single-cell values and treats them as missing.
+2. Imputation (Subtask 0) — median imputation fit on train fold only; drops constant columns.
+3. Outlier row detection (Subtask 1) — RobustScaler + IsolationForest fit on the train fold only. Tuned contamination against {0, 0.01, 0.02, 0.05, 0.10}: 0 (no removal) won once evaluated leak-free.
+4. Feature selection (Subtask 2) — modular (mi / xgb_importance / permutation available). xgb_importance beat mi. N_SELECTED_FEATURES tuned against {50,100,200,300,500,all}; settled on 300.
+5. Regression (Main task) — a 5-model stacking ensemble (pipeline.build_base_models): two XGBoost configs (shallow/heavily-regularized "xgb_main" and deeper/less-regularized "xgb_diverse"), ElasticNet (scaled internally), ExtraTreesRegressor, and HistGradientBoostingRegressor, blended by a non-negative-least-squares meta-model (LinearRegression(positive=True)) trained on out-of-fold predictions from an inner 5-fold CV (so the meta-model never sees predictions from data its base models were trained on). main.py's MODEL_TYPE switch falls back to the single tuned XGBRegressor (max_depth=4, learning_rate=0.03, n_estimators=500, subsample=0.8, colsample_bytree=0.4, reg_lambda=5.0, min_child_weight=1) if the ~15x-cheaper single-model fit is preferred.
 
-Next step if you want to push the score higher: try stacking multiple model types, tune the outlier contamination rate, or experiment with feature counts beyond 250 — happy to iterate.
+Result: leak-free CV R^2 = 0.5168 +/- 0.0642 (MAE 4.99, RMSE 6.72) with the stacking ensemble, up from 0.5015 +/- 0.0653 for the single XGB. The ensemble improved every one of the 5 folds individually, not just the average. submission.csv is written in the exact sample.csv format, ready for Kaggle upload.
+
+Iteration history on the ensemble (each tested via eval_ensemble.py's leak-free 5-fold harness, keeping whatever validated best):
+- Per-base-model standalone R^2: xgb_main 0.512, xgb_diverse 0.512, extra_trees 0.489, hist_gb 0.488, elasticnet 0.387 (weak alone, still pulls real weight in the blend -- its errors are decorrelated from the trees').
+- Gave ElasticNet alternative feature sets (mi-ranked, more/fewer features, PCA-style alternatives) and retuned alpha/l1_ratio: no variant beat its current xgb_importance-300 features (all ~0.32-0.39 R^2) -- its ceiling is a genuine linear-vs-nonlinear gap, not a feature-selection problem.
+- Tried adding SVR (RBF kernel, ~0.47 R^2 standalone) as a 6th base model: left the ensemble's CV score statistically unchanged (0.5149 vs 0.5148) for ~90s/fold extra cost, so it was dropped again.
+- Compared meta-models on identical cached OOF predictions: Ridge (alpha 0.1-10, all ~0.5148, insensitive to alpha), plain average (0.5107, worse), non-negative least squares (0.5168, best on R^2/MAE/RMSE together) -- adopted NNLS.
+
+Next step if you want to push further: per-base-model feature sets tied to each model's inductive bias (not just ElasticNet, which didn't pan out), or a second stacking layer -- diminishing returns expected at this point, happy to keep iterating if useful.
